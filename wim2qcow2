@@ -28,6 +28,7 @@ DEFAULT_NBD_SCAN_LIMIT = 16
 DEFAULT_LAYOUT = "full-disk-gpt"
 DEFAULT_TARGET_PARTITION = "/dev/sda3"
 DEFAULT_NTFS_LABEL = "windows"
+DEFAULT_SANITIZE_LOGODIDAKT = False
 BCD_BOOTMGR_GUID = "{9dea862c-5cdd-4e70-acc1-f32b344d4795}"
 BCD_TEMPLATE_EFI_GUID = "{b012b84d-c47c-4ed5-b722-c0c42163e569}"
 BCD_TEMPLATE_SETUP_GUID = "{cbd971bf-b7b8-4885-951a-fa03044f5d71}"
@@ -636,6 +637,24 @@ SETUP_CLEANUP_GLOBS = (
     "Windows/Panther/setupact.log",
     "Windows/Panther/setuperr.log",
 )
+LOGODIDAKT_CLEANUP_PATHS = (
+    Path("logoDIDACT"),
+    Path("Program Files/LogoDIDACT"),
+    Path("Program Files (x86)/logoDIDACT"),
+    Path("Windows/System32/GroupPolicy"),
+    Path("Windows/System32/GroupPolicyUsers"),
+    Path("ProgramData/Microsoft/Windows/Start Menu/Programs/Startup/ld-launch-panel.vbs"),
+    Path("ProgramData/Microsoft/Windows/Start Menu/Programs/Startup/id-launch-panel.vbs"),
+)
+LOGODIDAKT_CLEANUP_GLOBS = (
+    "ProgramData/Microsoft/Windows/Start Menu/Programs/LogoDIDACT*",
+    "ProgramData/Microsoft/Windows/Start Menu/Programs/Startup/*launch-panel*",
+    "ProgramData/Microsoft/Windows/Start Menu/Programs/Startup/ld-*",
+    "ProgramData/Microsoft/Windows/Start Menu/Programs/Startup/id-*",
+    "ProgramData/chocolatey/lib/ld-*",
+    "ProgramData/chocolatey/.chocolatey/ld-*",
+    "ProgramData/Oracle/Java/.oracle_jre_usage/*",
+)
 PROBLEMATIC_DRIVERSTORE_PREFIXES = ("ftdibus.inf_", "ftdiport.inf_")
 PROBLEMATIC_DRIVER_FILES = ("ftdibus.sys", "ftser2k.sys")
 PROBLEMATIC_INF_MARKERS = (
@@ -716,6 +735,7 @@ class StartConfHints:
     partition_size: str | None = None
     partition_label: str | None = None
     system_type: str | None = None
+    group_name: str | None = None
 
 
 class Logger:
@@ -965,9 +985,20 @@ def prompt_choice(prompt: str, options: Sequence[tuple[str, str]], default_value
 
 def prompt_existing_path(prompt: str, default: str | None = None, *, kind: str = "file", allow_empty: bool = False) -> str:
     while True:
-        value = prompt_text(prompt, default=default, allow_empty=allow_empty)
-        if not value and allow_empty:
+        suffix = f" [{default}]" if default not in (None, "") else ""
+        answer = input(f"{prompt}{suffix}: ").strip()
+        if allow_empty and answer == "-":
             return ""
+        if not answer:
+            if default is not None:
+                value = default
+            elif allow_empty:
+                return ""
+            else:
+                print("Eingabe erforderlich.")
+                continue
+        else:
+            value = answer
         path = Path(value).expanduser()
         if kind == "file" and path.is_file():
             return str(path.resolve())
@@ -976,12 +1007,70 @@ def prompt_existing_path(prompt: str, default: str | None = None, *, kind: str =
         print(f"Pfad nicht gefunden ({kind}): {path}")
 
 
-def choose_detected_path(candidates: Sequence[Path], title: str) -> str | None:
-    if not candidates:
+def prompt_output_path(prompt: str, default: str) -> str:
+    while True:
+        value = prompt_text(prompt, default=default)
+        path = Path(value).expanduser()
+        if value.endswith(os.sep) or path.is_dir():
+            path = path / Path(default).name
+        if not path.parent.exists():
+            print(f"Zielverzeichnis nicht gefunden: {path.parent}")
+            continue
+        return str(path.resolve())
+
+
+def guess_start_conf_from_output(output_path: str | None) -> str | None:
+    if not output_path:
         return None
+    group_name = Path(output_path).stem
+    if not group_name:
+        return None
+    guesses = (
+        Path("/srv/linbo") / f"start.conf.{group_name}",
+        Path("/srv/linbo") / f"start.conf-{group_name}",
+        Path("/srv/linbo") / f"start.conf_{group_name}",
+    )
+    for guess in guesses:
+        if guess.is_file():
+            return str(guess.resolve())
+    return None
+
+
+def choose_detected_path(
+    candidates: Sequence[Path],
+    title: str,
+    *,
+    kind: str = "file",
+    default_path: str | None = None,
+    limit: int | None = None,
+) -> str | None:
+    if not candidates:
+        return default_path
+    shown_candidates = list(candidates[:limit]) if limit else list(candidates)
     print(title)
-    options = [(str(path), str(path)) for path in candidates]
-    return prompt_choice("Bitte auswaehlen", options, str(candidates[0]))
+    options = [(str(path), str(path)) for path in shown_candidates]
+    values = {str(index): value for index, (_, value) in enumerate(options, start=1)}
+    labels = {str(index): label for index, (label, _) in enumerate(options, start=1)}
+    default_value = default_path or str(shown_candidates[0])
+    reverse = {value: key for key, value in values.items()}
+    for key in values:
+        marker = " (Standard)" if values[key] == default_value else ""
+        print(f"  {key}) {labels[key]}{marker}")
+    if limit and len(candidates) > len(shown_candidates):
+        print(f"  ... {len(candidates) - len(shown_candidates)} weitere")
+    while True:
+        prompt_default = reverse.get(default_value, default_value)
+        answer = input(f"Bitte auswaehlen oder Pfad eingeben [{prompt_default}]: ").strip()
+        if not answer:
+            return default_value
+        if answer in values:
+            return values[answer]
+        path = Path(answer).expanduser()
+        if kind == "file" and path.is_file():
+            return str(path.resolve())
+        if kind == "dir" and path.is_dir():
+            return str(path.resolve())
+        print("Bitte eine gueltige Nummer oder einen existierenden Pfad eingeben.")
 
 
 def default_output_for_input(input_path: Path) -> Path:
@@ -998,6 +1087,7 @@ def summarize_args(args: argparse.Namespace) -> None:
         print(f"  WIM-Index:        {args.index}")
         print(f"  Disk-Size:        {args.disk_size}")
         print(f"  NTFS-Label:       {args.ntfs_label}")
+        print(f"  Sanitize-LD:      {'ja' if args.sanitize_logodidakt else 'nein'}")
         if args.layout == "linuxmuster-partition":
             print(f"  start.conf:       {args.start_conf or '-'}")
             print(f"  Target-Partition: {args.target_partition}")
@@ -1039,6 +1129,7 @@ def apply_env_defaults(args: argparse.Namespace, parser: argparse.ArgumentParser
         "TARGET_PARTITION": "target_partition",
         "COPY_SIDECARS_FROM": "copy_sidecars_from",
         "NTFS_LABEL": "ntfs_label",
+        "SANITIZE_LOGODIDAKT": "sanitize_logodidakt",
         "INSPECT": "inspect",
         "FORCE": "force",
         "LOGFILE": "logfile",
@@ -1055,7 +1146,7 @@ def apply_env_defaults(args: argparse.Namespace, parser: argparse.ArgumentParser
         raw = env_values[env_key]
         if attr == "index":
             setattr(args, attr, int(raw))
-        elif attr in {"inspect", "force", "verbose"}:
+        elif attr in {"inspect", "force", "verbose", "sanitize_logodidakt"}:
             setattr(args, attr, parse_env_value_as_bool(raw))
         else:
             setattr(args, attr, raw)
@@ -1067,7 +1158,7 @@ def run_interactive_wizard(args: argparse.Namespace) -> argparse.Namespace:
     print("")
 
     detected_wims = sorted(Path.cwd().glob("*.wim"))
-    selected_wim = choose_detected_path(detected_wims, "Gefundene WIM-Dateien im aktuellen Verzeichnis:") if detected_wims else None
+    selected_wim = choose_detected_path(detected_wims, "Gefundene WIM-Dateien im aktuellen Verzeichnis:", kind="file") if detected_wims else None
     args.input = prompt_existing_path("Pfad zur WIM-Datei", default=selected_wim, kind="file")
 
     require_tools(("wimlib-imagex",))
@@ -1104,14 +1195,22 @@ def run_interactive_wizard(args: argparse.Namespace) -> argparse.Namespace:
     )
 
     default_output = args.output or str(default_output_for_input(Path(args.input).resolve()))
-    args.output = prompt_text("Pfad zur Ausgabe-qcow2", default=default_output)
+    args.output = prompt_output_path("Pfad zur Ausgabe-qcow2 (inkl. Dateiname)", default_output)
 
     detected_start_conf = sorted(Path("/srv/linbo").glob("start.conf*")) if args.layout == "linuxmuster-partition" else []
-    default_start_conf = args.start_conf
+    default_start_conf = guess_start_conf_from_output(args.output) or args.start_conf
     if not default_start_conf and detected_start_conf:
-        default_start_conf = choose_detected_path(detected_start_conf[:10], "Gefundene start.conf-Dateien:")
+        default_start_conf = str(detected_start_conf[0].resolve())
+    if detected_start_conf:
+        default_start_conf = choose_detected_path(
+            detected_start_conf,
+            "Gefundene start.conf-Dateien:",
+            kind="file",
+            default_path=default_start_conf,
+            limit=10,
+        )
     args.start_conf = prompt_existing_path(
-        "LINBO start.conf (leer = keine Ableitung)",
+        "LINBO start.conf (Enter = Auswahl oben, '-' = keine Ableitung)",
         default=default_start_conf,
         kind="file",
         allow_empty=True,
@@ -1125,7 +1224,7 @@ def run_interactive_wizard(args: argparse.Namespace) -> argparse.Namespace:
     if args.layout == "linuxmuster-partition":
         args.target_partition = prompt_text("Zielpartition fuer .info", default=args.target_partition)
         reference_dir = prompt_existing_path(
-            "Referenzverzeichnis fuer .reg/.desc (leer = intern erzeugen)",
+            "Referenzverzeichnis fuer .reg/.desc und Linuxmuster-Boot-Seed (.qcow2)",
             default=args.copy_sidecars_from,
             kind="dir",
             allow_empty=True,
@@ -1134,6 +1233,11 @@ def run_interactive_wizard(args: argparse.Namespace) -> argparse.Namespace:
     else:
         args.target_partition = DEFAULT_TARGET_PARTITION
         args.copy_sidecars_from = None
+
+    args.sanitize_logodidakt = prompt_yes_no(
+        "LogoDidakt-/Domain-/Autologon-Reste entfernen",
+        default=args.sanitize_logodidakt,
+    )
 
     args.logfile = prompt_text("Logfile (leer = keines)", default=args.logfile, allow_empty=True) or None
     args.verbose = prompt_yes_no("Verbose-Ausgabe aktivieren", default=args.verbose)
@@ -1285,6 +1389,51 @@ def windows_setup_software_patch() -> str:
     )
 
 
+def windows_logodidakt_system_patch() -> str:
+    return textwrap.dedent(
+        """\
+        Windows Registry Editor Version 5.00
+
+        [HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Services\\ld-deploy-agent]
+        "Start"=dword:00000004
+
+        [HKEY_LOCAL_MACHINE\\SYSTEM\\ControlSet001\\Services\\Tcpip\\Parameters]
+        "Domain"=""
+        "NV Domain"=""
+        "DhcpDomain"=-
+        "SearchList"=-
+        """
+    )
+
+
+def windows_logodidakt_software_patch() -> str:
+    return textwrap.dedent(
+        """\
+        Windows Registry Editor Version 5.00
+
+        [HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon]
+        "AutoAdminLogon"="0"
+        "DefaultUserName"=-
+        "DefaultDomainName"=-
+        "AltDefaultDomainName"=-
+        "AutoLogonSID"=-
+        "AutoLogonCount"=-
+        "ForceAutoLogon"=dword:00000000
+        "LastUsedUsername"=-
+        "LastUsedDomain"=-
+
+        [HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System]
+        "LegalNoticeCaption"=-
+        "LegalNoticeText"=-
+
+        [HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Group Policy\\History]
+        "MachineDomain"=-
+        "DCName"=-
+        "NetworkName"=-
+        """
+    )
+
+
 def remove_problematic_driver_packages(windows_mount: Path, logger: Logger) -> None:
     driverstore = windows_mount / "Windows" / "System32" / "DriverStore" / "FileRepository"
     for prefix in PROBLEMATIC_DRIVERSTORE_PREFIXES:
@@ -1317,6 +1466,16 @@ def cleanup_windows_setup_artifacts(windows_mount: Path, logger: Logger) -> None
     remove_problematic_driver_packages(windows_mount, logger)
 
 
+def cleanup_logodidakt_artifacts(windows_mount: Path, logger: Logger) -> None:
+    for relative_path in LOGODIDAKT_CLEANUP_PATHS:
+        remove_path(windows_mount / relative_path, logger)
+    for pattern in LOGODIDAKT_CLEANUP_GLOBS:
+        for candidate in sorted(windows_mount.glob(pattern)):
+            if candidate.name.lower() == "desktop.ini":
+                continue
+            remove_path(candidate, logger)
+
+
 def fix_state_ini(windows_mount: Path, logger: Logger) -> None:
     state_ini = windows_mount / "Windows" / "Setup" / "State" / "State.ini"
     if not state_ini.is_file():
@@ -1331,7 +1490,7 @@ def fix_state_ini(windows_mount: Path, logger: Logger) -> None:
     logger.debug("State.ini auf IMAGE_STATE_COMPLETE gesetzt")
 
 
-def sanitize_applied_windows_image(windows_mount: Path, logger: Logger) -> None:
+def sanitize_applied_windows_image(windows_mount: Path, logger: Logger, *, sanitize_logodidakt: bool = False) -> None:
     system_hive = windows_mount / "Windows" / "System32" / "config" / "SYSTEM"
     software_hive = windows_mount / "Windows" / "System32" / "config" / "SOFTWARE"
     if not system_hive.is_file():
@@ -1343,6 +1502,10 @@ def sanitize_applied_windows_image(windows_mount: Path, logger: Logger) -> None:
     fix_state_ini(windows_mount, logger)
     import_reg_patch(system_hive, r"HKEY_LOCAL_MACHINE\SYSTEM", windows_setup_system_patch(), logger)
     import_reg_patch(software_hive, r"HKEY_LOCAL_MACHINE\SOFTWARE", windows_setup_software_patch(), logger)
+    if sanitize_logodidakt:
+        cleanup_logodidakt_artifacts(windows_mount, logger)
+        import_reg_patch(system_hive, r"HKEY_LOCAL_MACHINE\SYSTEM", windows_logodidakt_system_patch(), logger)
+        import_reg_patch(software_hive, r"HKEY_LOCAL_MACHINE\SOFTWARE", windows_logodidakt_software_patch(), logger)
 
 
 def wait_for_paths(paths: Sequence[Path], timeout: float = 10.0) -> None:
@@ -1355,14 +1518,18 @@ def wait_for_paths(paths: Sequence[Path], timeout: float = 10.0) -> None:
     raise ToolError(f"Partitionen wurden nicht sichtbar: {missing}")
 
 
-def connect_nbd(image_path: Path, logger: Logger) -> Path:
+def connect_nbd(image_path: Path, logger: Logger, *, read_only: bool = False) -> Path:
     run_command(["modprobe", "nbd", "max_part=16"], logger)
     errors: list[str] = []
     for index in range(DEFAULT_NBD_SCAN_LIMIT):
         device = Path(f"/dev/nbd{index}")
         if not device.exists():
             continue
-        result = run_command(["qemu-nbd", "--connect", str(device), str(image_path)], logger, check=False)
+        args = ["qemu-nbd"]
+        if read_only:
+            args.append("--read-only")
+        args.extend(["--connect", str(device), str(image_path)])
+        result = run_command(args, logger, check=False)
         if result.returncode == 0:
             return device
         stderr = result.stderr if isinstance(result.stderr, str) else result.stderr.decode("utf-8", "replace")
@@ -1760,6 +1927,7 @@ def derive_start_conf_hints(path: Path) -> StartConfHints:
         partition_size=partition_size,
         partition_label=partition_label,
         system_type=linbo.get("SystemType"),
+        group_name=linbo.get("Group"),
     )
 
 
@@ -1778,6 +1946,203 @@ def apply_start_conf_defaults(args: argparse.Namespace, logger: Logger) -> None:
     if args.ntfs_label == DEFAULT_NTFS_LABEL and hints.partition_label:
         args.ntfs_label = hints.partition_label
         logger.debug(f"NTFS-Label aus start.conf uebernommen: {args.ntfs_label}")
+
+
+def detect_linuxmuster_reference_qcow2(reference_dir: Path, logger: Logger) -> Path | None:
+    if not reference_dir.exists():
+        raise ToolError(f"Referenzpfad nicht gefunden: {reference_dir}")
+    if reference_dir.is_file():
+        if reference_dir.suffix.lower() != ".qcow2":
+            raise ToolError(f"Referenzpfad ist keine qcow2-Datei: {reference_dir}")
+        return reference_dir
+
+    matches = sorted(path for path in reference_dir.glob("*.qcow2") if path.is_file())
+    if not matches:
+        logger.debug(f"Keine Referenz-qcow2 im Verzeichnis gefunden: {reference_dir}")
+        return None
+    if len(matches) > 1:
+        names = ", ".join(path.name for path in matches)
+        logger.warn(
+            "Mehrere Referenz-qcow2-Dateien gefunden; verwende den ersten Treffer: "
+            f"{matches[0].name} ({names})"
+        )
+    return matches[0]
+
+
+def write_linuxmuster_marker(windows_mount: Path, image_base: str, logger: Logger) -> None:
+    marker = windows_mount / ".linbo"
+    marker.write_text(image_base + "\n", encoding="utf-8")
+    logger.debug(f"Linuxmuster-Marker geschrieben: {marker}")
+
+
+def extract_partition_number(device: str | None) -> str | None:
+    if not device:
+        return None
+    base = os.path.basename(device.rstrip("/"))
+    digits: list[str] = []
+    for char in reversed(base):
+        if char.isdigit():
+            digits.append(char)
+            continue
+        if digits:
+            break
+    if not digits:
+        return None
+    return "".join(reversed(digits))
+
+
+def linuxmuster_partname_candidates(target_partition: str | None, boot_dir: Path) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str | None) -> None:
+        if not value or value in seen:
+            return
+        seen.add(value)
+        candidates.append(value)
+
+    if target_partition:
+        add(os.path.basename(target_partition.rstrip("/")))
+
+    for source in sorted(boot_dir.glob("BCD.*.*")):
+        parts = source.name.split(".", 2)
+        if len(parts) == 3:
+            add(parts[2])
+
+    partition_number = extract_partition_number(target_partition)
+    if partition_number:
+        for template in (
+            "disk0p{n}",
+            "sda{n}",
+            "hda{n}",
+            "vda{n}",
+            "xvda{n}",
+            "nvme0n1p{n}",
+            "mmcblk0p{n}",
+        ):
+            add(template.format(n=partition_number))
+    return candidates
+
+
+def write_linuxmuster_ntfs_id(boot_dir: Path, ntfs_device: Path | None, logger: Logger) -> None:
+    if ntfs_device is None:
+        return
+    ntfs_id_path = boot_dir / "ntfs.id"
+    with ntfs_device.open("rb") as handle:
+        handle.seek(8 * 9)
+        data = handle.read(8)
+    if len(data) != 8:
+        raise ToolError(f"ntfs.id konnte nicht aus {ntfs_device} gelesen werden.")
+    ntfs_id_path.write_bytes(data)
+    logger.debug(f"Linuxmuster-ntfs.id aktualisiert: {ntfs_id_path}")
+
+
+def materialize_linuxmuster_backups(
+    windows_mount: Path,
+    group_name: str | None,
+    target_partition: str | None,
+    ntfs_device: Path | None,
+    logger: Logger,
+) -> None:
+    boot_dir = windows_mount / "EFI" / "Microsoft" / "Boot"
+    if not boot_dir.is_dir():
+        return
+
+    write_linuxmuster_ntfs_id(boot_dir, ntfs_device, logger)
+
+    if not group_name:
+        return
+
+    partnames = linuxmuster_partname_candidates(target_partition, boot_dir)
+    bcd_path = boot_dir / "BCD"
+    if bcd_path.is_file():
+        removed = 0
+        for source in sorted(boot_dir.glob("BCD.*.*")):
+            source.unlink()
+            removed += 1
+        created = 0
+        for partname in partnames:
+            destination = boot_dir / f"BCD.{group_name}.{partname}"
+            shutil.copy2(bcd_path, destination)
+            created += 1
+            logger.debug(f"Linuxmuster-BCD-Backup geschrieben: {destination.name}")
+        logger.debug(f"Linuxmuster-BCD-Backups neu erzeugt: entfernt={removed}, erstellt={created}")
+
+    bsmbr_bytes = None
+    for source in sorted(boot_dir.glob("bsmbr.*")):
+        if bsmbr_bytes is None:
+            bsmbr_bytes = source.read_bytes()
+        source.unlink()
+    if bsmbr_bytes is not None:
+        destination = boot_dir / f"bsmbr.{group_name}"
+        destination.write_bytes(bsmbr_bytes)
+        logger.debug(f"Linuxmuster-MBR-Backup geschrieben: {destination.name}")
+
+
+def apply_linuxmuster_reference_boot_seed(
+    windows_mount: Path,
+    image_base: str,
+    reference_dir: Path | None,
+    group_name: str | None,
+    target_partition: str | None,
+    ntfs_device: Path | None,
+    logger: Logger,
+) -> bool:
+    write_linuxmuster_marker(windows_mount, image_base, logger)
+    if reference_dir is None:
+        logger.warn(
+            "Kein Referenzverzeichnis fuer Linuxmuster-Bootmetadaten angegeben. "
+            "Das Partitionsimage wird ohne .guid.* und ohne donor-EFI-Seed erstellt."
+        )
+        return False
+
+    donor_image = detect_linuxmuster_reference_qcow2(reference_dir, logger)
+    if donor_image is None:
+        logger.warn(
+            f"Im Referenzverzeichnis wurde keine qcow2-Datei gefunden: {reference_dir}. "
+            "Es werden nur interne Sidecars erzeugt."
+        )
+        return False
+
+    logger.step(f"Uebernehme Linuxmuster-Bootmetadaten aus Referenzimage: {donor_image.name}")
+    donor_nbd = connect_nbd(donor_image, logger, read_only=True)
+    donor_mount = Path(tempfile.mkdtemp(prefix="wim2qcow2-donor-", dir="/tmp"))
+    copied_guids = 0
+    copied_boot_dir = False
+    try:
+        mount_partition(donor_nbd, donor_mount, logger, fs_type="ntfs3", options="ro")
+
+        for relative_name in (".guid.disk", ".guid.efi", ".guid.part"):
+            source = donor_mount / relative_name
+            if not source.is_file():
+                continue
+            shutil.copy2(source, windows_mount / relative_name)
+            copied_guids += 1
+            logger.debug(f"Uebernommen aus Referenzimage: {relative_name}")
+
+        donor_boot_dir = donor_mount / "EFI" / "Microsoft" / "Boot"
+        target_boot_dir = windows_mount / "EFI" / "Microsoft" / "Boot"
+        if donor_boot_dir.is_dir():
+            if target_boot_dir.exists():
+                shutil.rmtree(target_boot_dir)
+            target_boot_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(donor_boot_dir, target_boot_dir)
+            copied_boot_dir = True
+            logger.debug(f"Uebernommen aus Referenzimage: {donor_boot_dir}")
+    finally:
+        run_command(["umount", str(donor_mount)], logger, check=False)
+        disconnect_nbd(donor_nbd, logger)
+        safe_rmtree(donor_mount)
+
+    if copied_guids != 3 or not copied_boot_dir:
+        logger.warn(
+            "Referenzimage enthaelt keinen vollstaendigen Linuxmuster-Bootsatz "
+            "(.guid.disk/.guid.efi/.guid.part plus EFI/Microsoft/Boot). "
+            "Falle auf interne Hook-Logik zurueck."
+        )
+        return False
+    materialize_linuxmuster_backups(windows_mount, group_name, target_partition, ntfs_device, logger)
+    return True
 
 
 def linuxmuster_info_path(output_path: Path) -> Path:
@@ -2007,7 +2372,7 @@ EOF
     )
 
 
-def linuxmuster_prestart_template() -> str:
+def legacy_linuxmuster_prestart_template() -> str:
     return (
         textwrap.dedent(
             """\\
@@ -2104,7 +2469,7 @@ def linuxmuster_prestart_template() -> str:
     )
 
 
-def linuxmuster_postsync_template() -> str:
+def legacy_linuxmuster_postsync_template() -> str:
     return (
         textwrap.dedent(
             """\\
@@ -2159,6 +2524,26 @@ def linuxmuster_postsync_template() -> str:
     )
 
 
+def linuxmuster_prestart_template() -> str:
+    return textwrap.dedent(
+        """\
+        # linuxmuster wim2qcow2 generated prestart
+        # Bewusst leer: Linuxmuster soll mit dem im Image gepraegten Bootsatz allein booten.
+        exit 0
+        """
+    )
+
+
+def linuxmuster_postsync_template() -> str:
+    return textwrap.dedent(
+        """\
+        # linuxmuster wim2qcow2 generated postsync
+        # Bewusst leer: Linuxmuster soll die im Image eingebetteten Bootmetadaten selbst verarbeiten.
+        exit 0
+        """
+    )
+
+
 def linuxmuster_reg_template() -> str:
     return textwrap.dedent(
         """\
@@ -2205,11 +2590,15 @@ def write_linuxmuster_desc(output_path: Path, image: WimImage, source_wim: Path)
     return desc_path
 
 
-def write_linuxmuster_hooks(output_path: Path) -> list[Path]:
+def write_linuxmuster_hooks(output_path: Path, *, donor_boot_seed: bool) -> list[Path]:
     prestart_path = linuxmuster_sidecar_path(output_path, ".prestart")
     postsync_path = linuxmuster_sidecar_path(output_path, ".postsync")
-    prestart_path.write_text(linuxmuster_prestart_template(), encoding="utf-8")
-    postsync_path.write_text(linuxmuster_postsync_template(), encoding="utf-8")
+    if donor_boot_seed:
+        prestart_path.write_text(linuxmuster_prestart_template(), encoding="utf-8")
+        postsync_path.write_text(linuxmuster_postsync_template(), encoding="utf-8")
+    else:
+        prestart_path.write_text(legacy_linuxmuster_prestart_template(), encoding="utf-8")
+        postsync_path.write_text(legacy_linuxmuster_postsync_template(), encoding="utf-8")
     return [prestart_path, postsync_path]
 
 
@@ -2272,6 +2661,7 @@ def convert_full_disk(
     state: ConversionState,
     *,
     ntfs_label: str,
+    sanitize_logodidakt: bool,
 ) -> str:
     logger.step("Verbinde qcow2 per NBD")
     state.nbd_device = connect_nbd(partial_output, logger)
@@ -2298,7 +2688,7 @@ def convert_full_disk(
     run_command(["wimlib-imagex", "apply", str(input_path), str(image.index), str(windows_mount)], logger)
 
     logger.step("Bereinige Windows-Setup-/Sysprep-Zustand offline")
-    sanitize_applied_windows_image(windows_mount, logger)
+    sanitize_applied_windows_image(windows_mount, logger, sanitize_logodidakt=sanitize_logodidakt)
 
     logger.step("Installiere EFI-Bootdateien")
     boot_mode = install_boot_files(
@@ -2319,11 +2709,16 @@ def convert_linuxmuster_partition(
     input_path: Path,
     image: WimImage,
     partial_output: Path,
+    output_path: Path,
     logger: Logger,
     state: ConversionState,
     *,
     ntfs_label: str,
-) -> None:
+    sanitize_logodidakt: bool,
+    reference_dir: Path | None,
+    group_name: str | None,
+    target_partition: str | None,
+) -> bool:
     logger.step("Verbinde qcow2 per NBD")
     state.nbd_device = connect_nbd(partial_output, logger)
 
@@ -2342,10 +2737,21 @@ def convert_linuxmuster_partition(
     run_command(["wimlib-imagex", "apply", str(input_path), str(image.index), str(windows_mount)], logger)
 
     logger.step("Bereinige Windows-Setup-/Sysprep-Zustand offline")
-    sanitize_applied_windows_image(windows_mount, logger)
+    sanitize_applied_windows_image(windows_mount, logger, sanitize_logodidakt=sanitize_logodidakt)
+
+    donor_boot_seed = apply_linuxmuster_reference_boot_seed(
+        windows_mount,
+        output_path.stem,
+        reference_dir,
+        group_name,
+        target_partition,
+        state.nbd_device,
+        logger,
+    )
 
     logger.step("Synchronisiere und trenne NBD")
     release_state(state, logger)
+    return donor_boot_seed
 
 
 def convert(args: argparse.Namespace, logger: Logger) -> None:
@@ -2357,6 +2763,7 @@ def convert(args: argparse.Namespace, logger: Logger) -> None:
     if not input_path.is_file():
         raise ToolError(f"Eingabe-WIM nicht gefunden: {input_path}")
 
+    start_conf_hints = derive_start_conf_hints(Path(args.start_conf).resolve()) if args.start_conf else StartConfHints()
     metadata = parse_wim_metadata(input_path, logger)
     image = choose_image(metadata, args.index)
     disk_size_bytes = parse_size(args.disk_size)
@@ -2370,17 +2777,23 @@ def convert(args: argparse.Namespace, logger: Logger) -> None:
 
     state = ConversionState(partial_output=partial_output)
     boot_mode = "not-run"
+    linuxmuster_donor_seed = False
     info_path: Path | None = None
     sidecars: list[Path] = []
     try:
         if args.layout == "linuxmuster-partition":
-            convert_linuxmuster_partition(
+            linuxmuster_donor_seed = convert_linuxmuster_partition(
                 input_path,
                 image,
                 partial_output,
+                output_path,
                 logger,
                 state,
                 ntfs_label=args.ntfs_label,
+                sanitize_logodidakt=args.sanitize_logodidakt,
+                reference_dir=Path(args.copy_sidecars_from).resolve() if args.copy_sidecars_from else None,
+                group_name=start_conf_hints.group_name or output_path.stem,
+                target_partition=args.target_partition,
             )
             boot_mode = "linuxmuster-partition"
         else:
@@ -2391,6 +2804,7 @@ def convert(args: argparse.Namespace, logger: Logger) -> None:
                 logger,
                 state,
                 ntfs_label=args.ntfs_label,
+                sanitize_logodidakt=args.sanitize_logodidakt,
             )
 
         logger.step("Pruefe qcow2")
@@ -2407,7 +2821,7 @@ def convert(args: argparse.Namespace, logger: Logger) -> None:
             logger.step("Schreibe Linuxmuster-Info-Datei")
             info_path = write_linuxmuster_info(output_path, args.target_partition, disk_size_bytes, final_size)
             logger.step("Erzeuge Linuxmuster-Hooks")
-            sidecars.extend(write_linuxmuster_hooks(output_path))
+            sidecars.extend(write_linuxmuster_hooks(output_path, donor_boot_seed=linuxmuster_donor_seed))
             logger.step("Erzeuge Linuxmuster-Reg-Datei")
             sidecars.append(write_linuxmuster_reg(output_path))
             logger.step("Erzeuge Linuxmuster-Desc-Datei")
@@ -2457,8 +2871,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--start-conf", help="LINBO start.conf zur Ableitung von Root-Partition, Groesse und Label")
     parser.add_argument("--target-partition", default=DEFAULT_TARGET_PARTITION, help="Zielpartition fuer .qcow2.info im Linuxmuster-Modus")
-    parser.add_argument("--copy-sidecars-from", help="Referenzverzeichnis fuer .reg/.desc im Linuxmuster-Modus; .prestart/.postsync werden automatisch erzeugt")
+    parser.add_argument(
+        "--copy-sidecars-from",
+        help=(
+            "Referenzverzeichnis fuer Linuxmuster-Dateien. "
+            ".reg/.desc werden uebernommen; eine enthaltene .qcow2 dient als donor "
+            "fuer EFI/Microsoft/Boot und .guid.*"
+        ),
+    )
     parser.add_argument("--ntfs-label", default=DEFAULT_NTFS_LABEL, help="NTFS-Label fuer das Zielvolume")
+    parser.add_argument(
+        "--sanitize-logodidakt",
+        action="store_true",
+        default=DEFAULT_SANITIZE_LOGODIDAKT,
+        help="Entfernt logoDIDACT-, Domain-, Autologon- und lokale Group-Policy-Reste offline",
+    )
     parser.add_argument("--inspect", action="store_true", help="Nur WIM analysieren und verfuegbare Images auflisten")
     parser.add_argument("--interactive", action="store_true", help="Interaktiver Wizard fuer die Konvertierung")
     parser.add_argument("--env-file", help="Pfad zu einer env-Datei mit Default-Werten fuer die Konvertierung")
